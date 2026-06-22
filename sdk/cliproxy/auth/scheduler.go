@@ -206,7 +206,11 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 	providerKey := strings.ToLower(strings.TrimSpace(provider))
 	modelKey := canonicalModelKey(model)
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
-	preferWebsocket := cliproxyexecutor.DownstreamWebsocket(ctx) && providerPrefersWebsocketTransport(providerKey) && pinnedAuthID == ""
+	// Account pin via X-CLIProxy-Account header / ?account= query (flexible match
+	// by id/index/label/filename/email). When set, restricts selection to that
+	// account; an unmatched pin yields an "unavailable" error (no silent fallback).
+	accountPinValue := accountPin(opts)
+	preferWebsocket := cliproxyexecutor.DownstreamWebsocket(ctx) && providerPrefersWebsocketTransport(providerKey) && pinnedAuthID == "" && accountPinValue == ""
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -223,6 +227,9 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 	}
 	predicate := func(entry *scheduledAuth) bool {
 		if entry == nil || entry.auth == nil {
+			return false
+		}
+		if accountPinValue != "" && !authMatchesPin(entry.auth, accountPinValue) {
 			return false
 		}
 		if pinnedAuthID != "" && entry.auth.ID != pinnedAuthID {
@@ -277,6 +284,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		return picked, providerKey, nil
 	}
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	accountPinValue := accountPin(opts)
 	modelKey := canonicalModelKey(model)
 
 	s.mu.Lock()
@@ -310,7 +318,16 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
 	}
 
-	predicate := triedPredicate(tried)
+	basePredicate := triedPredicate(tried)
+	predicate := basePredicate
+	if accountPinValue != "" {
+		predicate = func(entry *scheduledAuth) bool {
+			if entry == nil || entry.auth == nil || !authMatchesPin(entry.auth, accountPinValue) {
+				return false
+			}
+			return basePredicate(entry)
+		}
+	}
 	candidateShards := make([]*modelScheduler, len(normalized))
 	bestPriority := 0
 	hasCandidate := false
