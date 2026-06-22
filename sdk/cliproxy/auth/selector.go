@@ -256,12 +256,14 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 // Pick selects the next available auth for the provider in a round-robin manner.
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	now := time.Now()
+	// An account pin is resolved across ALL priority tiers before the normal
+	// top-tier truncation, so a lower-priority pinned account stays reachable.
+	if pinned, requested, perr := resolvePin(opts, auths, model, now); requested {
+		return pinned, perr
+	}
 	available, err := getAvailableAuths(auths, provider, model, now)
 	if err != nil {
 		return nil, err
-	}
-	if pinned, requested, perr := pinnedSelection(opts, available); requested {
-		return pinned, perr
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	key := provider + ":" + canonicalModelKey(model)
@@ -295,12 +297,12 @@ func (s *RoundRobinSelector) ensureCursorKey(key string, limit int) {
 // Pick selects the first available auth for the provider in a deterministic manner.
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	now := time.Now()
+	if pinned, requested, perr := resolvePin(opts, auths, model, now); requested {
+		return pinned, perr
+	}
 	available, err := getAvailableAuths(auths, provider, model, now)
 	if err != nil {
 		return nil, err
-	}
-	if pinned, requested, perr := pinnedSelection(opts, available); requested {
-		return pinned, perr
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	return available[0], nil
@@ -420,14 +422,9 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 // that may be supported by different auth credentials, and to avoid cross-provider conflicts.
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	entry := selectorLogEntry(ctx)
-	// An explicit account pin always wins over session affinity.
-	if accountPin(opts) != "" {
-		now := time.Now()
-		available, err := getAvailableAuths(auths, provider, model, now)
-		if err != nil {
-			return nil, err
-		}
-		pinned, _, perr := pinnedSelection(opts, available)
+	// An explicit account pin always wins over session affinity (resolved across
+	// all priority tiers).
+	if pinned, requested, perr := resolvePin(opts, auths, model, time.Now()); requested {
 		return pinned, perr
 	}
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)

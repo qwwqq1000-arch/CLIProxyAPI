@@ -48,17 +48,15 @@ func (h *Handler) authBySelector(sel string) *coreauth.Auth {
 	return nil
 }
 
+// claudeAccessToken returns the account's OAuth access token only. The usage
+// endpoint is OAuth-only, so we deliberately do NOT fall back to a raw api_key
+// (which would 401 with a confusing error and send a key with the oauth beta).
 func claudeAccessToken(a *coreauth.Auth) string {
-	if a == nil {
+	if a == nil || a.Metadata == nil {
 		return ""
 	}
-	if a.Metadata != nil {
-		if v, ok := a.Metadata["access_token"].(string); ok && strings.TrimSpace(v) != "" {
-			return strings.TrimSpace(v)
-		}
-	}
-	if a.Attributes != nil {
-		return strings.TrimSpace(a.Attributes["api_key"])
+	if v, ok := a.Metadata["access_token"].(string); ok {
+		return strings.TrimSpace(v)
 	}
 	return ""
 }
@@ -118,10 +116,16 @@ func (h *Handler) fetchAnthropicUsage(ctx context.Context, auth *coreauth.Auth, 
 		b, _ := io.ReadAll(resp.Body)
 		return b, resp.StatusCode, nil
 	}
-	// Prefer the account's client (proxy + TLS fingerprint). On transport error,
-	// fall back to a plain direct request.
-	if b, st, err := do(helps.NewUtlsHTTPClient(ctx, h.cfg, auth, 20*time.Second)); err == nil {
+	// Prefer the account's client (proxy + TLS fingerprint).
+	b, st, err := do(helps.NewUtlsHTTPClient(ctx, h.cfg, auth, 20*time.Second))
+	if err == nil {
 		return b, st, nil
+	}
+	// If the account is pinned to a proxy/egress, do NOT fall back to a direct
+	// request: that would send the OAuth token from the server's real IP, which
+	// can trip Anthropic IP-mismatch heuristics and defeat egress isolation.
+	if auth != nil && strings.TrimSpace(auth.ProxyURL) != "" {
+		return nil, 0, err
 	}
 	return do(&http.Client{Timeout: 20 * time.Second})
 }

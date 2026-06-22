@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
@@ -92,6 +93,24 @@ func matchPinnedAuth(available []*Auth, pin string) *Auth {
 		}
 	}
 	return nil
+}
+
+// resolvePin resolves an account pin against ALL unblocked candidates across every
+// priority tier (not just the top tier), so a lower-priority pinned account is
+// still reachable. Returns (auth,true,nil) on match, (nil,false,nil) when no pin
+// was requested, and (nil,true,err) when a pin matched nothing available.
+func resolvePin(opts cliproxyexecutor.Options, auths []*Auth, model string, now time.Time) (*Auth, bool, error) {
+	pin := accountPin(opts)
+	if pin == "" {
+		return nil, false, nil
+	}
+	byPriority, _, _ := collectAvailableByPriority(auths, model, now)
+	for _, tier := range byPriority {
+		if a := matchPinnedAuth(tier, pin); a != nil {
+			return a, true, nil
+		}
+	}
+	return nil, true, &Error{Code: "account_not_available", Message: "pinned account '" + pin + "' is not available (unknown, disabled, or cooling down)"}
 }
 
 // pinnedSelection resolves an account pin against the available candidates.
