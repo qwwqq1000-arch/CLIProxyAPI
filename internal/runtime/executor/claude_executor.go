@@ -242,6 +242,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body = ensureModelMaxTokens(body, baseModel)
 
+	// Repair client-side malformations Anthropic rejects with 400:
+	// name-only built-in tools (web_search) and empty text content blocks.
+	body = sanitizeClaudeUpstreamRequest(body)
+
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 	body = disableThinkingIfToolChoiceForced(body)
 	body = normalizeClaudeTemperatureForThinking(body)
@@ -431,6 +435,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body = ensureModelMaxTokens(body, baseModel)
+
+	// Repair client-side malformations Anthropic rejects with 400:
+	// name-only built-in tools (web_search) and empty text content blocks.
+	body = sanitizeClaudeUpstreamRequest(body)
 
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 	body = disableThinkingIfToolChoiceForced(body)
@@ -1151,6 +1159,92 @@ func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 		}
 	}
 	return
+}
+
+// builtinToolServerType maps Anthropic built-in tool names to their canonical
+// server-tool "type". Used to repair name-only built-in tools that some clients
+// (e.g. web-search sub-agents) emit without a "type" and with a null input_schema,
+// which Anthropic rejects with "tools.N.custom.input_schema: Input does not match
+// the expected shape." Only web_search is mapped (the observed failure); other
+// built-ins use versioned type strings and are left untouched.
+var builtinToolServerType = map[string]string{
+	"web_search": "web_search_20250305",
+}
+
+// sanitizeClaudeUpstreamRequest repairs two client-side malformations Anthropic
+// rejects with 400, before the body is forwarded upstream:
+//
+//	(B) name-only built-in tools (web_search) lacking a server-tool "type" → attach it.
+//	(C) empty / whitespace-only text content blocks → replace text with a single space.
+//
+// Both are no-ops for well-formed requests.
+func sanitizeClaudeUpstreamRequest(body []byte) []byte {
+	body = normalizeNameOnlyBuiltinTools(body)
+	body = fixEmptyClaudeTextBlocks(body)
+	return body
+}
+
+// normalizeNameOnlyBuiltinTools attaches the canonical server-tool "type" to a
+// built-in tool that arrived with only a "name" (and a null/invalid input_schema),
+// then drops the bogus input_schema so Anthropic treats it as a server tool.
+func normalizeNameOnlyBuiltinTools(body []byte) []byte {
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.IsArray() {
+		return body
+	}
+	i := -1
+	tools.ForEach(func(_, tool gjson.Result) bool {
+		i++
+		idx := i
+		if strings.TrimSpace(tool.Get("type").String()) != "" {
+			return true // already typed — forward unchanged
+		}
+		serverType, ok := builtinToolServerType[strings.TrimSpace(tool.Get("name").String())]
+		if !ok {
+			return true
+		}
+		body, _ = sjson.SetBytes(body, fmt.Sprintf("tools.%d.type", idx), serverType)
+		body, _ = sjson.DeleteBytes(body, fmt.Sprintf("tools.%d.input_schema", idx))
+		return true
+	})
+	return body
+}
+
+// fixEmptyClaudeTextBlocks replaces empty/whitespace-only text in text content
+// blocks (in messages[].content[] and an array-form system[]) with a single
+// space, avoiding Anthropic's "text content blocks must be non-empty" 400.
+func fixEmptyClaudeTextBlocks(body []byte) []byte {
+	if msgs := gjson.GetBytes(body, "messages"); msgs.IsArray() {
+		mi := -1
+		msgs.ForEach(func(_, msg gjson.Result) bool {
+			mi++
+			midx := mi
+			content := msg.Get("content")
+			if !content.IsArray() {
+				return true
+			}
+			ci := -1
+			content.ForEach(func(_, block gjson.Result) bool {
+				ci++
+				if block.Get("type").String() == "text" && strings.TrimSpace(block.Get("text").String()) == "" {
+					body, _ = sjson.SetBytes(body, fmt.Sprintf("messages.%d.content.%d.text", midx, ci), " ")
+				}
+				return true
+			})
+			return true
+		})
+	}
+	if sys := gjson.GetBytes(body, "system"); sys.IsArray() {
+		si := -1
+		sys.ForEach(func(_, block gjson.Result) bool {
+			si++
+			if block.Get("type").String() == "text" && strings.TrimSpace(block.Get("text").String()) == "" {
+				body, _ = sjson.SetBytes(body, fmt.Sprintf("system.%d.text", si), " ")
+			}
+			return true
+		})
+	}
+	return body
 }
 
 func checkSystemInstructions(payload []byte) []byte {
