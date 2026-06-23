@@ -1210,39 +1210,64 @@ func normalizeNameOnlyBuiltinTools(body []byte) []byte {
 	return body
 }
 
-// fixEmptyClaudeTextBlocks replaces empty/whitespace-only text in text content
-// blocks (in messages[].content[] and an array-form system[]) with a single
-// space, avoiding Anthropic's "text content blocks must be non-empty" 400.
+// isEmptyTextBlock reports whether a content block is a text block whose text is
+// empty or whitespace-only. Anthropic rejects these with both "must be non-empty"
+// and "must contain non-whitespace text", so a whitespace replacement is NOT
+// enough — the block must be removed.
+func isEmptyTextBlock(block gjson.Result) bool {
+	return block.Get("type").String() == "text" && strings.TrimSpace(block.Get("text").String()) == ""
+}
+
+// keepNonEmptyTextBlocks returns the raw JSON of all blocks except empty/whitespace
+// text blocks, plus whether any were dropped.
+func keepNonEmptyTextBlocks(arr gjson.Result) (kept []string, dropped bool) {
+	kept = make([]string, 0, int(arr.Get("#").Int()))
+	arr.ForEach(func(_, block gjson.Result) bool {
+		if isEmptyTextBlock(block) {
+			dropped = true
+			return true
+		}
+		kept = append(kept, block.Raw)
+		return true
+	})
+	return kept, dropped
+}
+
+// fixEmptyClaudeTextBlocks REMOVES empty/whitespace-only text content blocks (in
+// messages[].content[] and an array-form system[]) which Anthropic rejects with
+// "text content blocks must be non-empty / must contain non-whitespace text".
+// If a message's content becomes empty after removal, a minimal non-whitespace
+// placeholder is inserted so the message stays valid; an emptied system array is
+// dropped entirely.
 func fixEmptyClaudeTextBlocks(body []byte) []byte {
 	if msgs := gjson.GetBytes(body, "messages"); msgs.IsArray() {
 		mi := -1
 		msgs.ForEach(func(_, msg gjson.Result) bool {
 			mi++
-			midx := mi
 			content := msg.Get("content")
 			if !content.IsArray() {
 				return true
 			}
-			ci := -1
-			content.ForEach(func(_, block gjson.Result) bool {
-				ci++
-				if block.Get("type").String() == "text" && strings.TrimSpace(block.Get("text").String()) == "" {
-					body, _ = sjson.SetBytes(body, fmt.Sprintf("messages.%d.content.%d.text", midx, ci), " ")
-				}
+			kept, dropped := keepNonEmptyTextBlocks(content)
+			if !dropped {
 				return true
-			})
+			}
+			if len(kept) == 0 {
+				kept = append(kept, `{"type":"text","text":"."}`)
+			}
+			body, _ = sjson.SetRawBytes(body, fmt.Sprintf("messages.%d.content", mi), []byte("["+strings.Join(kept, ",")+"]"))
 			return true
 		})
 	}
 	if sys := gjson.GetBytes(body, "system"); sys.IsArray() {
-		si := -1
-		sys.ForEach(func(_, block gjson.Result) bool {
-			si++
-			if block.Get("type").String() == "text" && strings.TrimSpace(block.Get("text").String()) == "" {
-				body, _ = sjson.SetBytes(body, fmt.Sprintf("system.%d.text", si), " ")
+		kept, dropped := keepNonEmptyTextBlocks(sys)
+		if dropped {
+			if len(kept) == 0 {
+				body, _ = sjson.DeleteBytes(body, "system")
+			} else {
+				body, _ = sjson.SetRawBytes(body, "system", []byte("["+strings.Join(kept, ",")+"]"))
 			}
-			return true
-		})
+		}
 	}
 	return body
 }
