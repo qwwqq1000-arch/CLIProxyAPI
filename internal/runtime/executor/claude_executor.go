@@ -1169,27 +1169,28 @@ func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 // the expected shape." Only web_search is mapped (the observed failure); other
 // built-ins use versioned type strings and are left untouched.
 // parseAnthropicResetTime extracts the rate-limit reset time from Anthropic's
-// 429 response headers. Prefers the unified (subscription) reset, then the
-// per-resource resets, then Retry-After. Returns the zero time when none is
-// present. Accepts RFC3339 timestamps, unix-epoch seconds, Retry-After seconds,
-// and HTTP-date Retry-After.
+// 429 response headers (unix-epoch seconds, the form Anthropic sends; RFC3339
+// and Retry-After also accepted). Returns the zero time when none is present.
+//
+// When the 7-day (weekly) window is the one that's exhausted, ITS reset is the
+// real recovery time — clearing the 5h window won't help while the weekly cap is
+// maxed — so the 7d reset is preferred in that case.
 func parseAnthropicResetTime(header http.Header) time.Time {
+	if anthropic7dExhausted(header) {
+		if t := parseEpochOrRFC3339(header.Get("Anthropic-Ratelimit-Unified-7d-Reset")); !t.IsZero() {
+			return t
+		}
+	}
 	for _, name := range []string{
 		"Anthropic-Ratelimit-Unified-Reset",
 		"Anthropic-Ratelimit-Unified-5h-Reset",
+		"Anthropic-Ratelimit-Unified-7d-Reset",
 		"Anthropic-Ratelimit-Unified-Status-Reset",
 		"Anthropic-Ratelimit-Requests-Reset",
 		"Anthropic-Ratelimit-Tokens-Reset",
 	} {
-		v := strings.TrimSpace(header.Get(name))
-		if v == "" {
-			continue
-		}
-		if t, err := time.Parse(time.RFC3339, v); err == nil {
+		if t := parseEpochOrRFC3339(header.Get(name)); !t.IsZero() {
 			return t
-		}
-		if epoch, err := strconv.ParseInt(v, 10, 64); err == nil && epoch > 0 {
-			return time.Unix(epoch, 0)
 		}
 	}
 	if v := strings.TrimSpace(header.Get("Retry-After")); v != "" {
@@ -1203,27 +1204,60 @@ func parseAnthropicResetTime(header http.Header) time.Time {
 	return time.Time{}
 }
 
-// injectClaudeResetHint, for a 429 (rate-limited) response, makes sure the error
-// body carries a human-readable limit reset time (e.g. "resets 1:50pm (UTC)") so
-// callers can see when the limit clears. If the body already mentions a reset it
-// is returned unchanged; otherwise the reset time derived from the response
-// headers is appended to the JSON error.message (or to the raw body as a
-// fallback). No-op for non-429 responses or when no reset time is available.
+// anthropic7dExhausted reports whether the unified 7-day (weekly) window is the
+// one rejecting the request — status "rejected" or utilization >= 100%.
+func anthropic7dExhausted(header http.Header) bool {
+	if strings.EqualFold(strings.TrimSpace(header.Get("Anthropic-Ratelimit-Unified-7d-Status")), "rejected") {
+		return true
+	}
+	if u, err := strconv.ParseFloat(strings.TrimSpace(header.Get("Anthropic-Ratelimit-Unified-7d-Utilization")), 64); err == nil && u >= 1.0 {
+		return true
+	}
+	return false
+}
+
+// parseEpochOrRFC3339 parses a reset header value as unix-epoch seconds or an
+// RFC3339 timestamp. Zero time when empty/invalid.
+func parseEpochOrRFC3339(v string) time.Time {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return time.Time{}
+	}
+	if epoch, err := strconv.ParseInt(v, 10, 64); err == nil && epoch > 0 {
+		return time.Unix(epoch, 0)
+	}
+	if t, err := time.Parse(time.RFC3339, v); err == nil {
+		return t
+	}
+	return time.Time{}
+}
+
+// formatResetTime renders a reset instant as "3:04pm (UTC)" when it falls later
+// today (UTC), or "Jan 2 3:04pm (UTC)" for a future day (e.g. a 7d reset days
+// out) so a bare time is never ambiguous.
+func formatResetTime(t time.Time) string {
+	t = t.UTC()
+	now := time.Now().UTC()
+	if t.Year() == now.Year() && t.YearDay() == now.YearDay() {
+		return t.Format("3:04pm") + " (UTC)"
+	}
+	return t.Format("Jan 2 3:04pm") + " (UTC)"
+}
+
+// injectClaudeResetHint, for a 429 (rate-limited) response, replaces the error
+// message with the canonical "You've hit your limit · resets <time> (UTC)",
+// where <time> is the reset of the binding window — the 7-day reset when the
+// weekly cap is what's exhausted, otherwise the 5h/unified reset. The upstream
+// body is left untouched when no reset time is available in the headers.
 func injectClaudeResetHint(statusCode int, header http.Header, body []byte) []byte {
 	if statusCode != http.StatusTooManyRequests {
 		return body
-	}
-	if bytes.Contains(bytes.ToLower(body), []byte("reset")) {
-		return body // Anthropic already included reset info (e.g. "resets 1:50pm")
 	}
 	reset := parseAnthropicResetTime(header)
 	if reset.IsZero() {
 		return body
 	}
-	// Normalize the message to the canonical form "You've hit your limit · resets
-	// <time> (UTC)" (matching Anthropic's subscription usage-limit wording),
-	// replacing the verbose rate-limit text rather than appending to it.
-	msg := "You've hit your limit · resets " + reset.UTC().Format("3:04pm") + " (UTC)"
+	msg := "You've hit your limit · resets " + formatResetTime(reset)
 	if gjson.ValidBytes(body) {
 		if out, err := sjson.SetBytes(body, "error.message", msg); err == nil {
 			return out
