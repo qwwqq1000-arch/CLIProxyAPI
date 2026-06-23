@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -336,7 +337,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = statusErr{code: httpResp.StatusCode, msg: string(injectClaudeResetHint(httpResp.StatusCode, httpResp.Header, b))}
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
@@ -529,7 +530,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = statusErr{code: httpResp.StatusCode, msg: string(injectClaudeResetHint(httpResp.StatusCode, httpResp.Header, b))}
 		return nil, err
 	}
 	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
@@ -770,7 +771,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
-		return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: string(b)}
+		return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: string(injectClaudeResetHint(resp.StatusCode, resp.Header, b))}
 	}
 	decodedBody, err := decodeResponseBody(resp.Body, resp.Header.Get("Content-Encoding"))
 	if err != nil {
@@ -1167,6 +1168,76 @@ func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 // which Anthropic rejects with "tools.N.custom.input_schema: Input does not match
 // the expected shape." Only web_search is mapped (the observed failure); other
 // built-ins use versioned type strings and are left untouched.
+// parseAnthropicResetTime extracts the rate-limit reset time from Anthropic's
+// 429 response headers. Prefers the unified (subscription) reset, then the
+// per-resource resets, then Retry-After. Returns the zero time when none is
+// present. Accepts RFC3339 timestamps, unix-epoch seconds, Retry-After seconds,
+// and HTTP-date Retry-After.
+func parseAnthropicResetTime(header http.Header) time.Time {
+	for _, name := range []string{
+		"Anthropic-Ratelimit-Unified-Reset",
+		"Anthropic-Ratelimit-Unified-5h-Reset",
+		"Anthropic-Ratelimit-Unified-Status-Reset",
+		"Anthropic-Ratelimit-Requests-Reset",
+		"Anthropic-Ratelimit-Tokens-Reset",
+	} {
+		v := strings.TrimSpace(header.Get(name))
+		if v == "" {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			return t
+		}
+		if epoch, err := strconv.ParseInt(v, 10, 64); err == nil && epoch > 0 {
+			return time.Unix(epoch, 0)
+		}
+	}
+	if v := strings.TrimSpace(header.Get("Retry-After")); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+			return time.Now().Add(time.Duration(secs) * time.Second)
+		}
+		if t, err := http.ParseTime(v); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+// injectClaudeResetHint, for a 429 (rate-limited) response, makes sure the error
+// body carries a human-readable limit reset time (e.g. "resets 1:50pm (UTC)") so
+// callers can see when the limit clears. If the body already mentions a reset it
+// is returned unchanged; otherwise the reset time derived from the response
+// headers is appended to the JSON error.message (or to the raw body as a
+// fallback). No-op for non-429 responses or when no reset time is available.
+func injectClaudeResetHint(statusCode int, header http.Header, body []byte) []byte {
+	if statusCode != http.StatusTooManyRequests {
+		return body
+	}
+	if bytes.Contains(bytes.ToLower(body), []byte("reset")) {
+		return body // Anthropic already included reset info (e.g. "resets 1:50pm")
+	}
+	reset := parseAnthropicResetTime(header)
+	if reset.IsZero() {
+		return body
+	}
+	hint := "resets " + reset.UTC().Format("3:04pm") + " (UTC)"
+	if msg := gjson.GetBytes(body, "error.message"); msg.Exists() {
+		newMsg := strings.TrimSpace(msg.String())
+		if newMsg != "" {
+			newMsg += " · "
+		}
+		newMsg += hint
+		if out, err := sjson.SetBytes(body, "error.message", newMsg); err == nil {
+			return out
+		}
+	}
+	suffix := " · " + hint
+	if len(bytes.TrimSpace(body)) == 0 {
+		suffix = hint
+	}
+	return append(append([]byte{}, body...), []byte(suffix)...)
+}
+
 var builtinToolServerType = map[string]string{
 	"web_search": "web_search_20250305",
 }
