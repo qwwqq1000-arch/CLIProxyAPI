@@ -1220,22 +1220,20 @@ func injectClaudeResetHint(statusCode int, header http.Header, body []byte) []by
 	if reset.IsZero() {
 		return body
 	}
-	hint := "resets " + reset.UTC().Format("3:04pm") + " (UTC)"
-	if msg := gjson.GetBytes(body, "error.message"); msg.Exists() {
-		newMsg := strings.TrimSpace(msg.String())
-		if newMsg != "" {
-			newMsg += " · "
-		}
-		newMsg += hint
-		if out, err := sjson.SetBytes(body, "error.message", newMsg); err == nil {
+	// Normalize the message to the canonical form "You've hit your limit · resets
+	// <time> (UTC)" (matching Anthropic's subscription usage-limit wording),
+	// replacing the verbose rate-limit text rather than appending to it.
+	msg := "You've hit your limit · resets " + reset.UTC().Format("3:04pm") + " (UTC)"
+	if gjson.ValidBytes(body) {
+		if out, err := sjson.SetBytes(body, "error.message", msg); err == nil {
 			return out
 		}
 	}
-	suffix := " · " + hint
-	if len(bytes.TrimSpace(body)) == 0 {
-		suffix = hint
+	// Non-JSON body fallback: wrap in a minimal Anthropic-style error.
+	if out, err := sjson.SetBytes([]byte(`{"type":"error","error":{"type":"rate_limit_error"}}`), "error.message", msg); err == nil {
+		return out
 	}
-	return append(append([]byte{}, body...), []byte(suffix)...)
+	return body
 }
 
 var builtinToolServerType = map[string]string{
